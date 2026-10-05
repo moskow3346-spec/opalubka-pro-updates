@@ -1,0 +1,107 @@
+name: Pause public release downloads
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/pause-public-downloads.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  unpublish-releases:
+    if: github.repository == 'moskow3346-spec/opalubka-pro-updates'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Preserve release files while converting published releases to drafts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+
+          repository = os.environ['TARGET_REPOSITORY']
+          if repository != 'moskow3346-spec/opalubka-pro-updates':
+              raise SystemExit('Unexpected target repository; no changes made.')
+          base = 'https://api.github.com/repos/' + repository
+          headers = {
+              'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2026-03-10',
+              'User-Agent': 'opalubka-public-download-pause',
+          }
+
+          def request(path, method='GET', payload=None):
+              data = None if payload is None else json.dumps(payload).encode('utf-8')
+              req_headers = dict(headers)
+              if data is not None:
+                  req_headers['Content-Type'] = 'application/json'
+              req = urllib.request.Request(base + path, data=data, headers=req_headers, method=method)
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.load(response)
+
+          def list_releases():
+              result = []
+              page = 1
+              while True:
+                  batch = request('/releases?per_page=100&page=' + str(page))
+                  if not isinstance(batch, list):
+                      raise RuntimeError('Unexpected releases response; stopping.')
+                  result.extend(batch)
+                  if len(batch) < 100:
+                      return result
+                  page += 1
+
+          # Gather every page before changing state, so pagination cannot skip releases.
+          releases = list_releases()
+          changed = 0
+          preserved_assets = 0
+          errors = []
+          for release in releases:
+              if release.get('draft'):
+                  continue
+              release_id = int(release['id'])
+              tag = str(release.get('tag_name', release_id))
+              if release.get('immutable'):
+                  errors.append(tag + ': immutable release; no deletion attempted')
+                  continue
+              try:
+                  result = request('/releases/' + str(release_id), 'PATCH', {'draft': True})
+                  if result.get('draft') is not True:
+                      raise RuntimeError('Release was not converted to draft')
+                  changed += 1
+                  preserved_assets += len(result.get('assets', []))
+                  print('Unpublished, with files preserved: ' + tag, flush=True)
+                  time.sleep(0.2)
+              except urllib.error.HTTPError as error:
+                  errors.append(tag + ': GitHub HTTP ' + str(error.code))
+              except Exception as error:
+                  errors.append(tag + ': ' + type(error).__name__)
+
+          remaining = [str(r.get('tag_name', r['id'])) for r in list_releases() if not r.get('draft')]
+          print('Releases converted to drafts: ' + str(changed))
+          print('Release assets preserved: ' + str(preserved_assets))
+          print('Published releases remaining: ' + str(len(remaining)))
+          summary = (
+              '## Public download pause\n'
+              + '- Releases converted to drafts: ' + str(changed) + '\n'
+              + '- Release assets preserved: ' + str(preserved_assets) + '\n'
+              + '- Published releases remaining: ' + str(len(remaining)) + '\n'
+              + '\nNo releases, assets, tags, or source code were deleted.\n'
+          )
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write(summary)
+          if errors:
+              print('\n'.join(errors), file=sys.stderr)
+          if errors or remaining:
+              raise SystemExit('Download pause is incomplete; review remaining published releases.')
+          PY
